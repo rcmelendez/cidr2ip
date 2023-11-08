@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -55,7 +56,7 @@ func main() {
 	err = saveToCSV(ips, file)
 	handleError(err)
 
-	fmt.Printf("IP addresses saved to %s", file)
+	fmt.Printf("IP list saved to %s\n", file)
 }
 
 func printHelp() {
@@ -84,6 +85,15 @@ func readFromFile(file string) ([]string, error) {
 
 	var cidrs []string
 
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	if stat.Size() == 0 {
+		return nil, fmt.Errorf("empty file: %s", file)
+	}
+
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		cidrs = append(cidrs, scanner.Text())
@@ -97,12 +107,30 @@ func readFromFile(file string) ([]string, error) {
 }
 
 func generateIPs(cidrs []string) ([]string, error) {
-	ips := []string{}
+	ipsChan := make(chan []string, len(cidrs))
+	var wg sync.WaitGroup
+
 	for _, cidr := range cidrs {
-		ipList, err := getIPsFromCIDR(cidr)
-		if err != nil {
-			return nil, err
-		}
+		wg.Add(1)
+		go func(c string) {
+			defer wg.Done()
+			ipList, err := getIPsFromCIDR(c)
+			if err != nil {
+				handleError(err)
+				return
+			}
+			ipsChan <- ipList
+		}(cidr)
+	}
+
+	// Start goroutine to close the channel once all workers are done
+	go func() {
+		wg.Wait()
+		close(ipsChan)
+	}()
+
+	var ips []string
+	for ipList := range ipsChan {
 		ips = append(ips, ipList...)
 	}
 
@@ -138,9 +166,11 @@ func saveToCSV(ips []string, file string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	w := csv.NewWriter(f)
+	buf := bufio.NewWriter(f)
+	defer buf.Flush()
+
+	w := csv.NewWriter(buf)
 	defer w.Flush()
 
 	for _, ip := range ips {
